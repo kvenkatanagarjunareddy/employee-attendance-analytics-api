@@ -1,0 +1,36 @@
+# REVIEW.md
+
+I reviewed the supplied starter `app/main.py` against the API contract and fixed the defects outlined below.
+
+| # | Where (starter) | What is wrong | How you'd notice it | How you fixed it |
+|---|---|---|---|---|
+| 1 | `health()` lines 72-74 | The health endpoint always returns 200 without checking MongoDB. | Stop MongoDB and call `/health`; it still reports OK. | Added a MongoDB `ping` command and return a `503` status when MongoDB is unavailable. |
+| 2 | MongoDB setup / startup | No database indexes are created at startup. | Inspect indexes on a fresh database; required indexes are missing, leading to full collection scans on large queries. | Added idempotent employee and attendance indexes during application startup. |
+| 3 | `EmployeeIn` lines 53-60 | Employee input has almost no validation. | Invalid employee codes, emails, dates, and shift times can easily reach the database. | Added robust Pydantic field validation for employee codes, names, emails, departments, shift times, and joined dates. |
+| 4 | `create_employee()` lines 77-85 | Duplicate checking uses `find_one()` before `insert_one()`, which is race-prone. | Two concurrent requests with the same `emp_code` can both pass the initial check. | Enforced a unique index on `emp_code` and handled `DuplicateKeyError` to cleanly return a `409` conflict. |
+| 5 | `create_employee()` line 82 | `created_at` is stored as a naive local datetime and returned directly. | The response fails to follow the API epoch-millisecond timestamp convention. | Stored a UTC-aware datetime and serialized it to epoch milliseconds before returning. |
+| 6 | `list_employees()` line 93 | Pagination is off-by-one because page 1 incorrectly skips a full page. | Requesting page 1 with `page_size=20` starts listing records from record 21 instead of 1. | Corrected the pagination skip calculation to `(page - 1) * page_size`. |
+| 7 | `list_employees()` line 94 | The `total` count ignores the active department filter. | Filtering by a specific department returns a total count larger than the actual matching employees. | Count documents using the same filtered query dictionary. |
+| 8 | `list_employees()` lines 88-96 | Page and page_size query parameters are not constrained by the contract. | Values like `page=0` or `page_size=1000` are accepted without error. | Added query parameter constraints (`ge=1` and `le=100`). |
+| 9 | `list_employees()` line 95 | Results are not sorted by `emp_code` as required. | The returned employee order can differ from the API contract specifications. | Added an explicit ascending sort on `emp_code`. |
+| 10 | `punch_in()` lines 101-105 | Unknown employees are not checked before attempting to read their shift fields. | An unknown `emp_code` triggers a server error instead of a proper `404`. | Added an explicit employee lookup check returning a `404` when missing. |
+| 11 | `PunchInIn` / `punch_in()` lines 63-66, 102 | Timestamp validation is missing, and `0` is treated as “not supplied”. | Passing `punched_at=0`, negative numbers, seconds, or floats can be accepted or misinterpreted. | Added strict integer epoch-millisecond validation and explicit `None` handling. |
+| 12 | `punch_in()` lines 102-103 | `datetime.fromtimestamp()` and `datetime.now()` create naive local datetimes. | Results depend entirely on the machine's local timezone, conflicting with the IST/UTC contract. | Used UTC-aware datetimes across the board and handled conversions at the API boundaries. |
+| 13 | `punch_in()` line 103 | Attendance date defaults to the simple local date of punch-in. | Punches occurring around midnight during overnight shifts get assigned to the wrong date. | Implemented proper overnight-shift attendance date calculation using IST offsets. |
+| 14 | `compute_late_minutes()` lines 33-37 | Late calculation relies on the timestamp's calendar date rather than the attendance date. | Overnight-shift punches end up being compared against the wrong shift start time. | Calculated shift start directly from the attendance date and applied the 10-minute grace period rule correctly. |
+| 15 | `compute_work_hours()` lines 40-41 | Python's built-in `round()` doesn't follow the half-up rounding rule. | Values sitting right on a rounding boundary can yield inconsistent results. | Used Python's `Decimal` type with `ROUND_HALF_UP`. |
+| 16 | `compute_overtime()` lines 44-47 | Overtime assumes the shift end always falls on the same calendar date. | Punch-outs happening after midnight for overnight shifts compute overtime incorrectly. | Detected overnight shifts and shifted the shift end date to the following calendar day. |
+| 17 | `punch_in()` lines 104-118 | Duplicate attendance is checked via query before insert, making it unsafe under concurrency. | Parallel punch-in requests can race past the check. | Relied on the unique `(emp_code, date)` index as the source of truth, catching duplicate-key exceptions as `409`. |
+| 18 | `punch_in()` lines 118-121 | Responses exposed an internal MongoDB `_id` field, violating the contract. | The response payload contained unwanted internal metadata fields. | Serialized only contract-approved fields and explicitly omitted MongoDB `_id`. |
+| 19 | `list_attendance()` lines 144-147 | The entire matching attendance collection was loaded into memory for Python sorting. | Performance degrades severely as attendance records scale up. | Pushed filtering, sorting, and pagination down to MongoDB to fetch only the requested page. |
+| 20 | `list_attendance()` lines 136-143 | Date strings lack validation, and reversed date ranges are permitted. | Invalid dates or cases where `date_from > date_to` fail to trigger the required `422` error. | Added explicit date parsing and range comparison validation. |
+| 21 | `list_attendance()` lines 129-131 | `status`, page, and page_size are unvalidated against the contract. | Unsupported status strings or invalid pagination numbers are accepted. | Added allowed status literals and strict pagination boundaries. |
+| 22 | `list_attendance()` lines 144-150 | Sorting omitted the required `emp_code` tie-breaker, and raw DB types were returned. | Same-date records had non-deterministic ordering, and datetimes didn't match the API format. | Sorted by date descending then `emp_code` ascending, and serialized response values properly. |
+| 23 | Missing startup/repository safeguards | The starter lacked concurrency and performance guarantees required for seeded large datasets. | Hidden test suites with parallel requests and large collections exposed race conditions or slow scans. | Added database-enforced uniqueness, atomic updates where needed, proper indexing, and bounded pagination. |
+
+---
+
+### Reviewed and Intentionally Kept
+* `MONGO_URI` and `MONGO_DB` are read from environment variables with safe local defaults for development; no credentials are hardcoded.
+* The basic FastAPI application layout was preserved since the architectural contract requires all application logic to remain inside `app/main.py`.
+* The provided `IST` offset definitions were retained and used consistently for all shift and calendar calculations.
